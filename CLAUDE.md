@@ -231,4 +231,4 @@ Table = CSR-like sparse 0/1 matrix (rows = distinct patterns, cols = bits) plus 
 - 2026-11-09: Inspected HLTPhysics NanoAOD for 403663/402360 (section above). Baseline 403663 (3534 files) is still running.
 - 2026-11-09: Recorded the user's answers (section above). Verified uproot+numpy decoding of the old EDM TriggerResults, including the per-path last-module index.
 - 2026-11-09: Design discussion → pattern-table approach, `steamrates/` package, metBx/muonBx dropped. Measured pattern tables on data and MC NanoAOD. Reviewed the Phase-2 ntuple doc.
-- 2026-11-09: Slide figure `docs/figures/combination_table_slide.png` (script + data JSON alongside). Implemented and validated the counting step (`steamrates/`, `validation/`); see the section above. Not committed.
+- 2026-11-09: Slide figure `docs/figures/combination_table_slide.png` (script + data JSON alongside). **Local only:** `docs/figures/` is git-ignored and was removed from the history at the user's request (no binaries in the repo). Implemented and validated the counting step (`steamrates/`, `validation/`); see the section above. The user committed and pushed it to `phase2`.

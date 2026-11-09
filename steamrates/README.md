@@ -17,8 +17,8 @@ over these rows and are computed at merge time:
 - overlaps;
 - prescaled rates.
 
-Changing a map or a prescale therefore never requires re-reading the ntuples. See
-[`docs/figures/combination_table_slide.png`](../docs/figures/combination_table_slide.png).
+Changing a map or a prescale therefore never requires re-reading the ntuples. The docstring of
+`patterns.py` has a worked example.
 
 ## Usage
 
