@@ -76,6 +76,20 @@ Project brief from the user: `initial_notes.txt`. Example recipe: `README.md`.
     - Minimal FWLite loop (getByLabel + `accept(j)` for all paths): ~1.0k events/s, 5 s/file.
     - uproot: ~16–19k events/s, 0.3 s/file. That is 4 procs ≈ 64k ev/s and 8 procs ≈ 78k ev/s, so EOS reads are not the limit at this scale.
     - → Baseline 403663 (3.5k files, 13.5M events): about 12 min on 1 core, about 3–4 min with 4–8 procs, for plain counting.
+  - Robust prototype: scratchpad `trdecode.py`.
+    - Reads N from every entry's header and validates the header bytes.
+    - Checks the streamer class versions (TriggerResults 11, HLTGlobalStatus 10, HLTPathStatus 10) and the memberwise flag.
+    - Fails loudly on an unknown layout, mixed N, mixed psetids or non-empty `names_`.
+    - Names come from `@trigger_paths` of the psetid PSet; strip `\x00` on both sides.
+    - Tested vs FWLite (accept, index, names), all identical: GRunV51/V59/V62 (1001 paths each) and two HI menus (394 paths).
+    - V51→V59 differ in 654 versioned names with the same count, so merge across menus on unversioned names. Keep FWLite as a validation/fallback reader.
+  - `EventAuxiliary` (needed for run/LS/BX): uproot also fails, but the raw bytes have a fixed 109-byte layout.
+    - run u4 @36, LS u4 @40, event u8 @44 (checked against FWLite for 402360).
+    - `bunchCrossing` = u4 at `[-12:-8]`, `orbitNumber` at `[-8:-4]`, `storeNumber` at `[-4:]`.
+    - Validate the header and the 109-byte length the same way as for TriggerResults.
+  - Trigger-pattern sparsity (402360 GRunV59, 40 files, 202k events): on average 3.5 fired paths/event (incl. the always-on `HLTriggerFirstPath`/`Status_OnCPU`), max 105.
+    - Only **12.6k distinct fired-path patterns (6% of events)**.
+    - → Storing "pattern → count (Σw, Σw²)" per chunk is compact, and ANY grouping/correlation/pure rate can then be computed at merge time without re-reading the ntuples.
   - Scaling decision (user, 2026-11-09): samples can be large, so keep batch support. Design: the work unit is a chunk of files → partial result (counts + (dataset, run, LS) set). The same function runs under a local process pool or condor, and the merge is executor-independent. Read large NanoAOD files in event chunks (`uproot.iterate`) to bound memory.
 - A single config file → own work dir containing config copy, job files, partial results, final JSON with metadata.
 - File lists are deduplicated and validated before job creation.
@@ -150,6 +164,41 @@ Inspection scripts (scratchpad, not in the repo): `inspect_nano.py`, `check_nano
   - Design the data normalization so per-LS lumi/PS tables (e.g. brilcalc; OMS needs an API key) can be plugged in later. **Don't build the per-LS source now.** MC-based Phase-2 is the main use.
 - STEAM_maps: the PAG/POG group assignment is hand-made by STEAM; see the note in the NanoAOD section.
 
+## Decisions (2026-11-09)
+- Start the rewrite with the step-2 counting script, as a new package `steamrates/` next to the old code. The final directory layout gets decided at the end.
+- Code style: functions/classes in separate modules, with thorough comments, especially in the byte decoders. All inputs come as CLI arguments (later wrapped in batch jobs). Output goes only to the explicit output path: no shared temp files, so parallel measurements are safe.
+- **Combination ("pattern") table approach approved**:
+  - A counting job stores the distinct fired-bit patterns with count/Σw/Σw²;
+  - all rates, groupings, pure rates and overlaps are computed at merge time.
+  - Fall back to fixed observables if it doesn't work out.
+- Partials: user OK'd JSON, but measurements favour ROOT (uproot, zstd) for the pattern table (see below). Pending user confirmation.
+- One **joint HLT+L1 table** (proposed; see measurements).
+- **Dropped: `metBx`/`muonBx` histograms** (BX distribution of events firing `HLT_PFMET*`/`HLT_IsoMu24*`, in `histos.N.root`). Nobody knows their purpose; the user is asking around. Re-add as an optional "BX distribution for selected paths" if someone needs them.
+
+## Pattern-table measurements (2026-11-09; scratchpad `patterns_nano.py`, `table_size.py`)
+Table = CSR-like sparse 0/1 matrix (rows = distinct patterns, cols = bits) plus per-row count/Σw/Σw².
+
+| sample | events | bits | fired/event (HLT / L1 / joint) | distinct patterns HLT / L1 / joint | joint table JSON / ROOT-zstd |
+|---|---|---|---|---|---|
+| 403663 HLTPhysics NANOAOD (data) | 372k | 843+508 | 2.4 / 5.1 / 7.5 | 2.5% / 10.3% / 15.1% | 5.6 MB / 0.7 MB |
+| VBFH→μμ Run3Winter26 NANOAODSIM (MC) | 100k–400k | 779+470 | 96 / 112 / 208 | 85% / 95.5% / 99.6% | 104 MB / 3.5 MB (100k ev) |
+
+- MC menus are fully unprescaled (no PrescaleService in the MC menu), so every event is ~unique. The table then degenerates into a sparse per-event bit dump, still ≈1/70 of the input (3.5 MB vs ~250 MB).
+- For MC, a joint table costs about the same as separate HLT and L1 tables. For data it is ~1.4×.
+- Pattern counts grow sublinearly with N in data.
+- Overlap matrix C = Xᵀ W X via `scipy.sparse`, cost ∝ Σ k² per pattern: 1.7 s for the data table (1351²), 13.6 s for 100k MC events.
+  - **numpy in CMSSW_16_0_6_patch1 has no optimized BLAS** (dense float32 gram 2000×1351 takes 15 s). Never use dense matmul; use scipy.sparse or bincount.
+- MC prescales must be applied at merge time anyway. With the table this is possible per pattern: P(path) = bit × 1/PS_HLT × P(L1 seed passes); OR of paths: 1 − Π(1 − p_i) (random-prescale approximation). The same works for any L1 PS column from unprescaled L1 bits, so multiple stored post-PS columns aren't needed.
+- The MC sample has negative weights (`genWeight` ±4.18) → keep Σw and Σw² per pattern. The `Runs` tree has `genEventSumw/Sumw2/Count`.
+- MC NANOAODSIM **embeds the HLT menu** in `ParameterSets` (process HLT, `/frozen/2025/2e34/v1.3/HLT/V4`, 927 paths, datasets; no PrescaleService) → the menu survives NanoAOD production (`menu_in_file.py`).
+
+## Phase-2 trigger-ntuple preview (user-provided HTML doc of `step2_inNANOAODSIM.root`, 2026-11-09)
+- NanoAOD-style flat ntuple. Events tree only documented: run/LS/event/BX/orbit and hlt* object collections (AK4 Puppi jets, electrons, photons, muons, taus, tracks, PF cands, PV, HT/MET).
+- Trigger bits in the example: only `DST_PFScouting`, `HLTriggerFinalPath`, `L1TrackTrigger_step`, `L1simulation_step`. **No `HLT_*` paths and no L1 seed bits** (maybe a scouting-only menu).
+  - NanoAOD keeps only names starting with HLT/L1/Flag or containing Scouting. Phase-2 GT algorithm paths (if named like `pSingleTkMuon22`; to verify) would be dropped.
+- No `genWeight`/`Pileup_*` in Events. Runs-tree content (`genEventSumw`) and the `ParameterSets` tree are not covered by the doc; they are likely present if written by the standard NanoAOD output module (as in Run-3 NANOAODSIM). Needs a real file.
+- The user will talk to the colleagues. Assume content similar to today's NanoAOD files for now; if the menu is missing, get it from ConfDB.
+
 ## Open questions for the user
 - Format and timeline of the common L1+HLT ntuple (and whether Step 1 is dropped). Will path versions be kept?
 - Website / JSON schema requirements.
@@ -158,3 +207,4 @@ Inspection scripts (scratchpad, not in the repo): `inspect_nano.py`, `check_nano
 - 2026-11-09: Explored repo; wrote `docs/WORKFLOW.md` (8 Mermaid charts, validated with mermaid-cli) and these notes. No code changed yet.
 - 2026-11-09: Inspected HLTPhysics NanoAOD for 403663/402360 (section above). Baseline 403663 (3534 files) is still running.
 - 2026-11-09: Recorded the user's answers (section above). Verified uproot+numpy decoding of the old EDM TriggerResults, including the per-path last-module index.
+- 2026-11-09: Design discussion → pattern-table approach, `steamrates/` package, metBx/muonBx dropped. Measured pattern tables on data and MC NanoAOD. Reviewed the Phase-2 ntuple doc. No package code written yet.
