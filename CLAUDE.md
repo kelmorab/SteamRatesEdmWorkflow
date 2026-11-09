@@ -84,7 +84,7 @@ Project brief from the user: `initial_notes.txt`. Example recipe: `README.md`.
     - Tested vs FWLite (accept, index, names), all identical: GRunV51/V59/V62 (1001 paths each) and two HI menus (394 paths).
     - V51→V59 differ in 654 versioned names with the same count, so merge across menus on unversioned names. Keep FWLite as a validation/fallback reader.
   - `EventAuxiliary` (needed for run/LS/BX): uproot also fails, but the raw bytes have a fixed 109-byte layout.
-    - run u4 @36, LS u4 @40, event u8 @44 (checked against FWLite for 402360).
+    - run u4 @35, LS u4 @39, event u8 @43 (corrected; verified event by event vs FWLite in `steamrates/readers/edm.py`). LuminosityBlockAuxiliary: run @35, LS @39.
     - `bunchCrossing` = u4 at `[-12:-8]`, `orbitNumber` at `[-8:-4]`, `storeNumber` at `[-4:]`.
     - Validate the header and the 109-byte length the same way as for TriggerResults.
   - Trigger-pattern sparsity (402360 GRunV59, 40 files, 202k events): on average 3.5 fired paths/event (incl. the always-on `HLTriggerFirstPath`/`Status_OnCPU`), max 105.
@@ -171,8 +171,31 @@ Inspection scripts (scratchpad, not in the repo): `inspect_nano.py`, `check_nano
   - A counting job stores the distinct fired-bit patterns with count/Σw/Σw²;
   - all rates, groupings, pure rates and overlaps are computed at merge time.
   - Fall back to fixed observables if it doesn't work out.
-- Partials: user OK'd JSON, but measurements favour ROOT (uproot, zstd) for the pattern table (see below). Pending user confirmation.
-- One **joint HLT+L1 table** (proposed; see measurements).
+- **Partials are ROOT files** written by uproot (zstd), confirmed by the user. Final outputs will be JSON for the website.
+- One **joint HLT+L1 table**.
+- Menu reading = "option 2" (user): path names cached by TriggerResults psetid, plus menu metadata (name, datasets, streams, PS table) from the first file of each menu, stored in each partial. The per-file psetid is recorded.
+- The STEAM PAG/POG group map stays a hand-maintained input; the stream/dataset maps can come from the embedded menu.
+
+## steamrates package (counting step implemented 2026-11-09)
+- `steamrates/` at the repo root; run `python3 -m steamrates.count|summary` from the repo root in cmsenv.
+- The usage, module table, partial file format and validation are documented in `steamrates/README.md`.
+- No PyROOT needed:
+  - EDM TriggerResults, EventAuxiliary, LuminosityBlockAuxiliary and the ParameterSets tree are all decoded from raw bytes (`rootbytes.py`, `readers/edm.py`, `menu.py`).
+  - ParameterSets entry: Hash<1> [0:29], blob headers [29:41], ROOT string at [41] (length byte; 255 → 4-byte length).
+- Performance:
+  - EDM: ~0.3 s/file (5k events), plus ~1.3 s for the first file of a menu (13.6 MB ParameterSets).
+  - A full parse of the multi-MB process PSet is slow in Python, so top-level entries are located with anchored regexes (`ParameterSetRegistry.entry`).
+  - NanoAOD: ~17k events/s.
+  - MC: 241k events in 33 s, 1.3 GB RSS.
+- Validation: `validation/compare_legacy_counts.py` and `validation/check_edm_reader_fwlite.py` (see the README).
+  - **402360 GRunV59, 1136 files: total and pure counts of all 999 paths identical to the legacy nomaps output**, with 5,721,135 events.
+  - Unique LS = 142 (legacy N_LS 1136 = 8 × 142, compensated by hlt_ps 480 = 60 × 8).
+- Partial sizes: data ~0.4 MB per 300k events; MC 8.2 MB per 241k events.
+- Next:
+  - merge step: normalization (data: lumi/PS/N_LS per sample, extensible to per-LS tables; MC: σ/Σw), datasets/streams from the menu, groups from the STEAM map, pure rates, overlaps, prescales, JSON output;
+  - job builder (local pool or condor);
+  - plots;
+  - regression vs the 403663 baseline once it's done.
 - **Dropped: `metBx`/`muonBx` histograms** (BX distribution of events firing `HLT_PFMET*`/`HLT_IsoMu24*`, in `histos.N.root`). Nobody knows their purpose; the user is asking around. Re-add as an optional "BX distribution for selected paths" if someone needs them.
 
 ## Pattern-table measurements (2026-11-09; scratchpad `patterns_nano.py`, `table_size.py`)
@@ -207,4 +230,5 @@ Table = CSR-like sparse 0/1 matrix (rows = distinct patterns, cols = bits) plus 
 - 2026-11-09: Explored repo; wrote `docs/WORKFLOW.md` (8 Mermaid charts, validated with mermaid-cli) and these notes. No code changed yet.
 - 2026-11-09: Inspected HLTPhysics NanoAOD for 403663/402360 (section above). Baseline 403663 (3534 files) is still running.
 - 2026-11-09: Recorded the user's answers (section above). Verified uproot+numpy decoding of the old EDM TriggerResults, including the per-path last-module index.
-- 2026-11-09: Design discussion → pattern-table approach, `steamrates/` package, metBx/muonBx dropped. Measured pattern tables on data and MC NanoAOD. Reviewed the Phase-2 ntuple doc. No package code written yet.
+- 2026-11-09: Design discussion → pattern-table approach, `steamrates/` package, metBx/muonBx dropped. Measured pattern tables on data and MC NanoAOD. Reviewed the Phase-2 ntuple doc.
+- 2026-11-09: Slide figure `docs/figures/combination_table_slide.png` (script + data JSON alongside). Implemented and validated the counting step (`steamrates/`, `validation/`); see the section above. Not committed.
