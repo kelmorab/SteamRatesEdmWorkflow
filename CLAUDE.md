@@ -66,13 +66,95 @@ Project brief from the user: `initial_notes.txt`. Example recipe: `README.md`.
 ## Design direction (agreed principles, details open)
 - One pipeline; data/MC differ only by (a) event selection (lumi JSON or none) and (b) a pluggable normalization (data: lumi × PS / (N_LS × t_LS); MC: σ × eff × L / N or Σw). MC is first-class: many samples, combine pT bins, weights.
 - Input-reader layer separate from the counting core (current EDM TriggerResults via FWLite/uproot now, common L1+HLT ntuple later).
+  - **The current `hlt_N.root` can be read without FWLite** (verified 2026-11-09, scratchpad `edm_uproot3.py`). uproot can't deserialize `edm::TriggerResults` (memberwise `vector<HLTPathStatus>`), but reading the branch as raw bytes (`AsJagged(AsDtype("u1"))`) works:
+    - 24-byte header, with the path count as a big-endian `u4` at bytes 20–24;
+    - then N big-endian `u2` status words: accept = `(s & 3) == 1`, last module index = `s >> 2`;
+    - the 16-byte psetid is at bytes `[-26:-10]`.
+  - All entries have the same size, so this is a numpy reshape. 5158 events × 1001 paths decode in 0.7 s, with 0 mismatches vs FWLite (accept + index, 1000 events).
+  - Trigger names: psetid → `ParameterSets` (uproot fails on that tree too; use PyROOT once per distinct psetid/menu).
+  - Timing (402360 ntuples, ~5k events/file, scratchpad `timing.py`/`timing_mp.py`). Both methods give identical counts.
+    - Minimal FWLite loop (getByLabel + `accept(j)` for all paths): ~1.0k events/s, 5 s/file.
+    - uproot: ~16–19k events/s, 0.3 s/file. That is 4 procs ≈ 64k ev/s and 8 procs ≈ 78k ev/s, so EOS reads are not the limit at this scale.
+    - → Baseline 403663 (3.5k files, 13.5M events): about 12 min on 1 core, about 3–4 min with 4–8 procs, for plain counting.
+  - Scaling decision (user, 2026-11-09): samples can be large, so keep batch support. Design: the work unit is a chunk of files → partial result (counts + (dataset, run, LS) set). The same function runs under a local process pool or condor, and the merge is executor-independent. Read large NanoAOD files in event chunks (`uproot.iterate`) to bound memory.
 - A single config file → own work dir containing config copy, job files, partial results, final JSON with metadata.
 - File lists are deduplicated and validated before job creation.
 
+## New ntuples: HLTPhysics NanoAOD (preliminary "common format"; inspected 2026-11-09)
+Files:
+- 403663: `/eos/cms/store/data/Run2026D/HLTPhysics/NANOAOD/PromptReco-v1/000/403/663/00000/*.root`. 3 files, 1.0M events, 1.3 GB.
+- 402360: `root://cms-xrd-global.cern.ch//store/data/Run2026B/HLTPhysics/NANOAOD/PromptReco-v1/000/402/360/00000/36a8e992-5ef5-4668-a01a-fb72197f4bed.root`. 346k events. Needs the grid proxy.
+- uproot over xrootd needs `handler=uproot.source.xrootd.XRootDSource` (fsspec-xrootd isn't installed).
+
+Structure: standard PromptReco NanoAOD.
+- Trees: `Events`, `LuminosityBlocks` (run, LS, fill, crossingAngle, betaStar, energy; **no lumi value**), `Runs`, `MetaData`, `ParameterSets`.
+- Trigger bits are flat `bool` branches, one per path:
+  - 810 `HLT_*`, 26 `DST_*` (only the Scouting ones), 5 `Dataset_*Scouting*`, `HLTriggerFirst/FinalPath`;
+  - 508 `L1_*` (+ `L1_FinalOR_BXmin1/2`, `L1_UnprefireableEvent*`);
+  - 28 `Flag_*`;
+  - plus L1 objects (`L1Mu/EG/Jet/Tau/EtSum`), `TrigObj_*`, and full physics objects.
+
+Differences from the old STEAM EDM ntuples:
+- **HLT bits are the ONLINE decisions** (process `HLT`, menu `/cdaq/physics/Run2026/2e34/v1.3.0/HLT/V3` for 403663), not a re-run of the menu under study (MYHLT).
+  - Evidence: the 402360 nano lacks 38 paths that exist in the GRunV59 re-run.
+  - → New-menu studies need re-HLT output in this format. Still to clarify with the colleagues.
+- **Version suffix stripped**: `HLT_IsoMu24`, not `HLT_IsoMu24_v33`. Done by `PhysicsTools/NanoAOD/plugins/TriggerOutputBranches.cc`: `rfind("_v")` for HLT*/L1*/*Scouting*.
+- **Only names starting with `HLT`, `L1`, `Flag` or containing `Scouting` are stored**. Dropped compared to the old ntuple (1001 paths): AlCa_ (13), Dataset_ (112 of 117), MC_ (25), DQM_ (3), Status_ (2), 2 non-scouting DST_.
+- Paths missing from a run's menu are **back-filled with 0**. "Never fired" therefore can't be told apart from "not in menu" without the menu.
+- If two processes store the same name, a `_p<process>` suffix is added (none seen).
+- **L1 bits = `getAlgoDecisionFinal()`** (`L1TriggerResultsConverter.cc:143`), i.e. AFTER L1 prescale and mask.
+  - 250 of 508 never fired (disabled or masked).
+  - Unprescaled L1 rates need the L1 PS table (not in the file). Seeds with PS 0 give no information.
+- LS are scattered across files (each file spans the whole run); no LS was found in two files.
+  - → N_LS must be a **deduplicated set taken from the `LuminosityBlocks` tree** ∩ JSON. Summing N_LS per job (current code) would give 3 × N_LS here, with no compensating factor in hlt_ps.
+  - Contrast: the current per-job N_LS sum works for EphemeralHLTPhysics 0–7 because the factor 8 (8 datasets × same LS) is put into hlt_ps on purpose (user confirmed). It breaks only if a (dataset, LS) pair is split across files or a file is listed twice. Cleaner design: count unique (dataset, run, LS) and let the normalization know the per-dataset PS and the number of datasets combined.
+  - The LB tree has one LS more than the LS seen in events (an LS with 0 events).
+- **Speed**: reading all ~1350 trigger bools for 372k events takes 14 s with uproot. A whole run is about 1 min on one core, so condor is likely not needed for plain counting.
+
+**The `ParameterSets` tree embeds the full online HLT config.** Find the process PSet with `@trigger_paths` + `datasets` + `streams`; sub-PSets are referenced by `+Q(<hex hash>)`, and the blobs contain NUL bytes. It provides:
+- `HLTConfigVersion.tableName` (menu name);
+- `datasets` (dataset → versioned paths);
+- `streams` (stream → datasets);
+- `@trigger_paths`;
+- per-path module lists;
+- `hltL1s*` modules → L1 seed expression (783 HLT/DST paths have one);
+- `PrescaleService` (15 columns, default `2p0E34`, 922 rows).
+
+→ The stream/dataset maps (`streamMap`, `datasetMap`, `datasetStreamMap`) and the path → L1-seed maps can come **from the input file itself**, which replaces the ConfDB/cx_Oracle half of STEAM_maps (`hltConfigFromDB` + `hltDumpStream`).
+  - It does NOT replace `groupMap`/`typeMap` (path → PAG/POG and type). These come from the ConfDB path *description* text ("group: …" lines, parsed in `hltDumpStream` ~L170) or from the hand-made `SteamDB.py`. They are curated by STEAM, are not part of the python config, and stay an external, hand-maintained input. Read it with PyROOT + `libFWCoreFWLite`: `std.pair("edm::Hash<1>","edm::ParameterSetBlob")`, and `hash.print(ostringstream)` for the hex key. Use `os._exit(0)` or `python -u`: PyROOT/XRootD can crash or hang at exit and lose buffered stdout.
+
+Normalization facts (403663 menu):
+- `HLT_Physics_v16` = `hltL1EventNumberL1Fat` (HLTL1NumberFilter, **period 107**, TCDS event number) + `hltPrePhysics` with PS 50 (25 in the Emergency column).
+  - → effective PS **5350**, matching the "hidden 107" comment for run 403182.
+  - "Hidden" because the HLTL1NumberFilter is not an `HLTPrescaler`: it isn't in the PS table and is only visible in the menu. It applies **only to HLTPhysics**, not to EphemeralHLTPhysics. Idea: derive the sample's effective PS automatically by walking the sample path's modules (HLTPrescaler × HLTL1NumberFilter period × dataset prescaler), with a config override.
+- `HLT_EphemeralPhysics_v10` PS 220 (2p0E34) × `Dataset_EphemeralHLTPhysicsN` PS 8 = 1760 = baseline `hlt_ps`.
+- HLTPhysics therefore has ~3× fewer events than EphemeralHLTPhysics 0-7 for the same LS.
+- Sanity check, LS 400–1700 (1301 LS, 556,746 events), scale = 5350 / (1301 × 23.31 s) = 0.1764 Hz/count:
+  - total L1 rate 98.2 kHz ✓
+  - HLT_IsoMu24 377 Hz (2138 counts)
+  - L1_SingleMu22 10.0 kHz
+  - HLT_ZeroBias 148 Hz
+- Still needed from outside the file: lumi per LS (lumi_in; OMS/brilcalc), the HLT/L1 PS column per LS, and the L1 prescale table.
+- Per-filter rates: Nano keeps only path pass/fail (no `HLTPathStatus::index()`), so they're not possible from these files.
+
+Inspection scripts (scratchpad, not in the repo): `inspect_nano.py`, `check_nano.py`, `compare_paths.py`, `psets2.py`, `prescales.py`, `sanity.py`.
+
+## Answers from the user (2026-11-09)
+- Common ntuple use cases: (a) recorded data with **re-run HLT** (+ possibly re-emulated L1), or (b) MC with emulated L1+HLT. Online-menu rates are not a use case.
+  - MC: run/LS are meaningless (run = 1), and no LS-based normalization is needed.
+- The user will ask the colleagues to include AlCa_/MC_/Dataset_ paths (needed).
+- L1 bits: probably post-prescale only; pre-PS bits maybe later. Colleagues discussed storing L1 decisions for several PS columns. With the embedded menu (path → L1 seed expression) we could then also compute HLT rates under other L1 columns.
+  - Caveat: with HLTPhysics data, only columns that tighten the online one are unbiased, because events that failed the online L1 are missing. MC and ZeroBias are fine.
+  - Caveat: the HLT path result already contains the online L1 seed decision.
+- Lumi/PS: the practice so far is to select LS with one PS column during lumi-levelling via the JSON, then use a constant hlt_ps and the average inst. lumi (from OMS) in `config_mergeOutputsData.py`. Keep that as the default.
+  - Design the data normalization so per-LS lumi/PS tables (e.g. brilcalc; OMS needs an API key) can be plugged in later. **Don't build the per-LS source now.** MC-based Phase-2 is the main use.
+- STEAM_maps: the PAG/POG group assignment is hand-made by STEAM; see the note in the NanoAOD section.
+
 ## Open questions for the user
-- Format and timeline of the common L1+HLT ntuple (and whether Step 1 is dropped).
-- Where L1 prescales/decisions come from for L1 rates.
+- Format and timeline of the common L1+HLT ntuple (and whether Step 1 is dropped). Will path versions be kept?
 - Website / JSON schema requirements.
 
 ## Status log
 - 2026-11-09: Explored repo; wrote `docs/WORKFLOW.md` (8 Mermaid charts, validated with mermaid-cli) and these notes. No code changed yet.
+- 2026-11-09: Inspected HLTPhysics NanoAOD for 403663/402360 (section above). Baseline 403663 (3534 files) is still running.
+- 2026-11-09: Recorded the user's answers (section above). Verified uproot+numpy decoding of the old EDM TriggerResults, including the per-path last-module index.
